@@ -35,7 +35,161 @@ def decode(data: bytes) -> object:
         ValueError: on non-canonical, indefinite-length, duplicate-key or
             invalid-UTF-8 input.
     """
-    raise NotImplementedError
+    import struct
+
+    if not isinstance(data, (bytes, bytearray)):
+        raise ValueError("decode expects a bytes object")
+    raw = bytes(data)
+    total = len(raw)
+    if total == 0:
+        raise ValueError("cannot decode an empty buffer")
+
+    pos = 0
+    missing = object()  # local sentinel: "no value produced yet"
+    stack = []
+    result = missing
+
+    # Iterative parser: nested containers live on an explicit stack, so the
+    # function body needs no recursive helper.
+    while result is missing:
+        if pos >= total:
+            raise ValueError("unexpected end of CBOR input")
+        initial = raw[pos]
+        pos += 1
+        major = initial >> 5
+        info = initial & 0x1F
+        value = missing
+
+        if major == 7:
+            # Simple values and floats share major type 7.
+            if info == 20:
+                value = False
+            elif info == 21:
+                value = True
+            elif info == 22:
+                value = None
+            elif info == 27:
+                if pos + 8 > total:
+                    raise ValueError("truncated binary64 float")
+                value = struct.unpack(">d", raw[pos:pos + 8])[0]
+                pos += 8
+            elif info in (25, 26):
+                # Only one fixed binary64 width is canonical here.
+                raise ValueError("non-canonical float width")
+            else:
+                raise ValueError(
+                    "unsupported simple value, break or reserved information"
+                )
+        else:
+            # Read the additional-information argument in its shortest form.
+            if info < 24:
+                arg = info
+            elif info == 24:
+                if pos + 1 > total:
+                    raise ValueError("truncated head")
+                arg = raw[pos]
+                pos += 1
+                if arg < 24:
+                    raise ValueError("non-shortest additional information")
+            elif info == 25:
+                if pos + 2 > total:
+                    raise ValueError("truncated head")
+                arg = int.from_bytes(raw[pos:pos + 2], "big")
+                pos += 2
+                if arg < 256:
+                    raise ValueError("non-shortest additional information")
+            elif info == 26:
+                if pos + 4 > total:
+                    raise ValueError("truncated head")
+                arg = int.from_bytes(raw[pos:pos + 4], "big")
+                pos += 4
+                if arg < 65536:
+                    raise ValueError("non-shortest additional information")
+            elif info == 27:
+                if pos + 8 > total:
+                    raise ValueError("truncated head")
+                arg = int.from_bytes(raw[pos:pos + 8], "big")
+                pos += 8
+                if arg < 4294967296:
+                    raise ValueError("non-shortest additional information")
+            else:
+                raise ValueError(
+                    "indefinite-length or reserved additional information"
+                )
+
+            if major == 0:
+                value = arg
+            elif major == 1:
+                value = -1 - arg
+            elif major == 2:
+                if pos + arg > total:
+                    raise ValueError("truncated byte string")
+                value = raw[pos:pos + arg]
+                pos += arg
+            elif major == 3:
+                if pos + arg > total:
+                    raise ValueError("truncated text string")
+                try:
+                    value = raw[pos:pos + arg].decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError("text string is not valid UTF-8") from exc
+                pos += arg
+            elif major == 4:
+                if arg == 0:
+                    value = []
+                else:
+                    stack.append(
+                        {"type": 4, "items": [], "left": arg, "key": missing}
+                    )
+            elif major == 5:
+                if arg == 0:
+                    value = {}
+                else:
+                    stack.append(
+                        {"type": 5, "items": {}, "left": arg, "key": missing}
+                    )
+            else:
+                raise ValueError("tags are not accepted in canonical form")
+
+        if value is missing:
+            # A non-empty container was opened; read its first child.
+            continue
+
+        # Hand the finished value to its parent, closing containers as needed.
+        while True:
+            if not stack:
+                result = value
+                break
+            frame = stack[-1]
+            if frame["type"] == 4:
+                frame["items"].append(value)
+                frame["left"] -= 1
+                if frame["left"]:
+                    break
+                stack.pop()
+                value = frame["items"]
+                continue
+            if frame["key"] is missing:
+                frame["key"] = value
+                break
+            key = frame["key"]
+            frame["key"] = missing
+            try:
+                duplicate = key in frame["items"]
+            except TypeError as exc:
+                raise ValueError("map key is not hashable") from exc
+            if duplicate:
+                raise ValueError("duplicate map key")
+            frame["items"][key] = value
+            frame["left"] -= 1
+            if frame["left"]:
+                break
+            stack.pop()
+            value = frame["items"]
+
+    if pos != total:
+        raise ValueError("trailing bytes after the top-level item")
+    return result
 
 
 def encode_head(major: int, value: int) -> bytes:
@@ -50,7 +204,27 @@ def encode_head(major: int, value: int) -> bytes:
     Raises:
         ValueError: if major or value is outside its permitted range.
     """
-    raise NotImplementedError
+    if isinstance(major, bool) or not isinstance(major, int):
+        raise ValueError("major type must be an int")
+    if not 0 <= major <= 7:
+        raise ValueError("major type must be between 0 and 7")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("head value must be an int")
+    if value < 0:
+        raise ValueError("head value must be non-negative")
+
+    prefix = major << 5
+    if value < 24:
+        return bytes((prefix | value,))
+    if value <= 0xFF:
+        return bytes((prefix | 24, value))
+    if value <= 0xFFFF:
+        return bytes((prefix | 25,)) + value.to_bytes(2, "big")
+    if value <= 0xFFFFFFFF:
+        return bytes((prefix | 26,)) + value.to_bytes(4, "big")
+    if value <= 0xFFFFFFFFFFFFFFFF:
+        return bytes((prefix | 27,)) + value.to_bytes(8, "big")
+    raise ValueError("unsigned value does not fit in 64 bits")
 
 
 def encode_int(value: int) -> bytes:
@@ -64,7 +238,13 @@ def encode_int(value: int) -> bytes:
     Raises:
         ValueError: if value is not an int, or is a bool.
     """
-    raise NotImplementedError
+    if isinstance(value, bool):
+        raise ValueError("bool is not encoded as an integer")
+    if not isinstance(value, int):
+        raise ValueError("value must be an int")
+    if value >= 0:
+        return encode_head(0, value)
+    return encode_head(1, -1 - value)
 
 
 def encode_bytes(data: Union[bytes, str]) -> bytes:
@@ -79,7 +259,15 @@ def encode_bytes(data: Union[bytes, str]) -> bytes:
         ValueError: if data is neither bytes nor str, or if a str cannot be
             encoded as UTF-8.
     """
-    raise NotImplementedError
+    if isinstance(data, bytes):
+        return encode_head(2, len(data)) + data
+    if isinstance(data, str):
+        try:
+            payload = data.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("text string is not valid UTF-8") from exc
+        return encode_head(3, len(payload)) + payload
+    raise ValueError("encode_bytes accepts bytes or str only")
 
 
 def sort_map(pairs: Sequence[Tuple[Any, Any]]) -> List[Tuple[Any, Any]]:
@@ -94,7 +282,23 @@ def sort_map(pairs: Sequence[Tuple[Any, Any]]) -> List[Tuple[Any, Any]]:
     Raises:
         ValueError: if a key is unhashable, duplicated, or not encodable.
     """
-    raise NotImplementedError
+    ordered = []
+    seen = set()
+    for key, val in pairs:
+        try:
+            hash(key)
+        except TypeError as exc:
+            raise ValueError("map key is not hashable") from exc
+        encoded_key = encode(key)
+        # Identity is the canonical encoding itself: keys that encode to the
+        # same bytes are the same CBOR value, whatever Python type produced
+        # them, and keys of different types never collide.
+        if encoded_key in seen:
+            raise ValueError("duplicate map key")
+        seen.add(encoded_key)
+        ordered.append((encoded_key, key, val))
+    ordered.sort(key=lambda item: item[0])
+    return [(key, val) for _, key, val in ordered]
 
 
 def encode(value: Any) -> bytes:
@@ -112,7 +316,32 @@ def encode(value: Any) -> bytes:
         ValueError: for unsupported types, duplicate map keys, out-of-range
             integers or non-UTF-8 text.
     """
-    raise NotImplementedError
+    import struct
+
+    if value is None:
+        return b"\xf6"
+    if value is True:
+        return b"\xf5"
+    if value is False:
+        return b"\xf4"
+    if isinstance(value, int):
+        return encode_int(value)
+    if isinstance(value, float):
+        # One fixed width, big-endian, independent of platform or locale.
+        return b"\xfb" + struct.pack(">d", value)
+    if isinstance(value, (bytes, str)):
+        return encode_bytes(value)
+    if isinstance(value, (list, tuple)):
+        return encode_head(4, len(value)) + b"".join(
+            encode(item) for item in value
+        )
+    if isinstance(value, dict):
+        parts = [encode_head(5, len(value))]
+        for key, val in sort_map(list(value.items())):
+            parts.append(encode(key))
+            parts.append(encode(val))
+        return b"".join(parts)
+    raise ValueError(f"cannot canonically encode {type(value).__name__}")
 
 
 def canonical_digest(value: Any) -> str:
@@ -124,7 +353,9 @@ def canonical_digest(value: Any) -> str:
     the same map with different insertion order, therefore produce the same
     digest string of 64 lowercase hexadecimal characters.
     """
-    raise NotImplementedError
+    import hashlib
+
+    return hashlib.sha256(encode(value)).hexdigest()
 
 
 def canon_batch(documents: Sequence[Any], policy: str) -> dict:
@@ -140,4 +371,10 @@ def canon_batch(documents: Sequence[Any], policy: str) -> dict:
     Raises:
         ValueError: for an unknown policy or a document that encode rejects.
     """
-    raise NotImplementedError
+    if policy != "canonical":
+        raise ValueError("unsupported normalization policy")
+    # Every document is encoded from scratch; no ordering or memo state is
+    # carried over from the previous document.
+    encoded = [encode(document) for document in documents]
+    digests = [canonical_digest(document) for document in documents]
+    return {"policy": policy, "encoded": encoded, "digests": digests}
